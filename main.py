@@ -6,10 +6,10 @@ from datetime import datetime, timedelta
 import plotly.express as px
 import os
 import time
-from difflib import get_close_matches # 유사도 매칭용
+from difflib import get_close_matches
 
-# 1. UI 및 기본 설정
-st.set_page_config(layout="wide", page_title="X-Asset Sovereign V25.7", page_icon="🚀")
+# 1. UI 및 기본 설정 (원본 문구 및 스타일 보존)
+st.set_page_config(layout="wide", page_title="X-Asset Sovereign V25.8", page_icon="🚀")
 
 PORT_FILE = "my_assets_v24.csv"
 LOG_FILE = "daily_history_v24.csv"
@@ -22,7 +22,6 @@ if "last_change_time" not in st.session_state:
 st.markdown("""
     <style>
     .stApp { background-color: #FFFFFF; color: #1A1C23; }
-    [data-testid="stSidebar"] { background-color: #F8F9FA; border-right: 1px solid #DEE2E6; }
     .metric-card {
         background: #FFFFFF; padding: 20px; border-radius: 12px;
         border: 1px solid #E9ECEF; text-align: center;
@@ -38,8 +37,9 @@ def load_db(path):
     if os.path.exists(path):
         try:
             temp_df = pd.read_csv(path)
-            if 'Date' in temp_df.columns: temp_df.rename(columns={'Date': '날짜'}, inplace=True)
-            if 'Total_Value' in temp_df.columns: temp_df.rename(columns={'Total_Value': '총자산'}, inplace=True)
+            # 호환성 유지 (한글 항목명 강제화)
+            rename_map = {'Date': '날짜', 'Total_Value': '총자산'}
+            temp_df.rename(columns={k: v for k, v in rename_map.items() if k in temp_df.columns}, inplace=True)
             return temp_df
         except: return pd.DataFrame()
     return pd.DataFrame()
@@ -58,11 +58,10 @@ if 'portfolio' not in st.session_state:
     if st.session_state.portfolio.empty:
         st.session_state.portfolio = pd.DataFrame(columns=['Name', 'Ticker', 'BuyPrice', 'Quantity', 'Currency', 'Category'])
 
-# 3. 사이드바 - [유사도 매칭 복구]
+# 3. 사이드바 - [정밀 검색 및 오류 메시지 강화]
 krx_df = get_krx_listing()
 with st.sidebar:
     st.title("🛰️ Strategic Center")
-    st.info(f"⏱️ 실시간 동기화 ({st.session_state.refresh_count}회)")
     msg_slot = st.empty()
     
     with st.form("add_form", clear_on_submit=True):
@@ -76,9 +75,9 @@ with st.sidebar:
         
         if st.form_submit_button("포트폴리오에 추가"):
             if search_q:
-                # [복구] 가장 유사한 국내 종목 찾기
+                # [복구] 유사도 매칭 엔진
                 krx_names = krx_df['Name'].tolist() if not krx_df.empty else []
-                matches = get_close_matches(search_q, krx_names, n=1, cutoff=0.3)
+                matches = get_close_matches(search_q, krx_names, n=1, cutoff=0.2)
                 
                 if matches:
                     actual_name = matches[0]
@@ -94,19 +93,22 @@ with st.sidebar:
 
                 try:
                     tk = yf.Ticker(ticker)
-                    if tk.fast_info['last_price']:
+                    info = tk.fast_info
+                    if info['last_price'] is not None:
                         new_row = pd.DataFrame([{'Name': final_name, 'Ticker': ticker, 'BuyPrice': c_p, 'Quantity': c_q, 'Currency': curr, 'Category': category}])
                         st.session_state.portfolio = pd.concat([st.session_state.portfolio, new_row], ignore_index=True)
                         save_db(st.session_state.portfolio, PORT_FILE)
-                        st.success(f"✅ {final_name} 추가 완료")
+                        st.success(f"✅ {final_name}({ticker}) 추가 성공")
                         st.rerun()
-                    else: msg_slot.error("❌ 데이터 없음"); time.sleep(2); msg_slot.empty()
-                except: msg_slot.error("❌ 시스템 오류"); time.sleep(2); msg_slot.empty()
+                    else:
+                        msg_slot.error(f"❌ '{ticker}'는 유효한 티커가 아닙니다. 다시 확인해주세요.")
+                except Exception as e:
+                    msg_slot.error(f"❌ 시스템 오류: {str(e)}")
 
-# 4. 분석 엔진 (테스트용 1분 기록 적용)
+# 4. 분석 엔진 (1분 기록 및 비중 연산)
 if not st.session_state.portfolio.empty:
     df = st.session_state.portfolio.copy()
-    with st.spinner('Calculating...'):
+    with st.spinner('Syncing Global Markets...'):
         try: ex_rate = float(yf.download("KRW=X", period="1d", progress=False)['Close'].iloc[-1])
         except: ex_rate = 1350.0
 
@@ -120,67 +122,60 @@ if not st.session_state.portfolio.empty:
                 m = ex_rate if row['Currency'] == "USD" else 1
                 cp_krw.append(cp * m); bp_krw.append(row['BuyPrice'] * m)
                 v_krw.append(cp * row['Quantity'] * m); b_krw.append(row['BuyPrice'] * row['Quantity'] * m); chg_1d.append(day_chg)
-            except: cp_krw.append(0); bp_krw.append(0); v_krw.append(0); b_krw.append(0); chg_1d.append(0)
+            except: [x.append(0) for x in [cp_krw, bp_krw, v_krw, b_krw, chg_1d]]
 
         df['매수가(₩)'], df['현재가(₩)'], df['평가금액(₩)'], df['매입금액(₩)'] = bp_krw, cp_krw, v_krw, b_krw
         df['수익률(%)'] = (df['평가금액(₩)'] - df['매입금액(₩)']) / df['매입금액(₩)'] * 100
         df['전일대비(%)'] = chg_1d
         
-        total_val = sum(v_krw); total_buy = sum(b_krw)
+        total_val, total_buy = sum(v_krw), sum(b_krw)
         total_prof = total_val - total_buy
         total_roi = (total_prof / total_buy * 100) if total_buy > 0 else 0
         cat_sums = df.groupby('Category')['평가금액(₩)'].sum().to_dict()
 
-        # [테스트용 1분 기록 로직]
+        # [1분 대기 기록 로직]
         now_dt = datetime.now().strftime("%Y-%m-%d")
         log_df = load_db(LOG_FILE)
-        can_log = False
-        if log_df.empty or log_df.iloc[-1]['날짜'] != now_dt:
-            if datetime.now() > st.session_state.last_change_time + timedelta(minutes=1): # 1분으로 단축
-                can_log = True
-        
-        if can_log:
+        if (log_df.empty or log_df.iloc[-1]['날짜'] != now_dt) and (datetime.now() > st.session_state.last_change_time + timedelta(minutes=1)):
             new_log = {'날짜': now_dt, '총자산': total_val}
             new_log.update(cat_sums)
             log_df = pd.concat([log_df, pd.DataFrame([new_log])], ignore_index=True)
             save_db(log_df, LOG_FILE)
 
-    # 5. 메인 UI
-    st.title("🏆 X-Asset Sovereign V25.7")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    met = [("현재 총 자산가치", f"₩ {total_val:,.0f}"), ("매입 총 자산", f"₩ {total_buy:,.0f}"), ("자산 등락 금액", f"₩ {total_prof:+,.0f}"), ("수익률", f"{total_roi:+,.2f}%"), ("환율", f"₩ {ex_rate:,.1f}")]
-    for i, col in enumerate([m1, m2, m3, m4, m5]):
-        col.markdown(f'<div class="metric-card"><div class="metric-label">{met[i][0]}</div><div class="metric-value">{met[i][1]}</div></div>', unsafe_allow_html=True)
+    # 5. 메인 UI (원본 문구 보존)
+    st.title("🏆 X-Asset Sovereign V25.8")
+    cols = st.columns(5)
+    metrics = [("현재 총 자산가치", f"₩ {total_val:,.0f}"), ("매입 총 자산", f"₩ {total_buy:,.0f}"), ("자산 등락 금액", f"₩ {total_prof:+,.0f}"), ("수익률", f"{total_roi:+,.2f}%"), ("실시간 환율", f"₩ {ex_rate:,.1f}")]
+    for i, col in enumerate(cols):
+        col.markdown(f'<div class="metric-card"><div class="metric-label">{metrics[i][0]}</div><div class="metric-value">{metrics[i][1]}</div></div>', unsafe_allow_html=True)
 
     t1, t2 = st.tabs(["📊 실시간 현황", "📅 성장 분석 리포트"])
     
     with t1:
         st.subheader("📌 통합 포트폴리오 (원화 환산)")
-        disp = df[['Name', 'Category', '매수가(₩)', '현재가(₩)', '수익률(%)', '전일대비(%)', 'Quantity']].copy()
-        st.dataframe(disp.style.format({'매수가(₩)':'{:,.0f}','현재가(₩)':'{:,.0f}','수익률':'{:+.2f}%','전일대비':'{:+.2f}%','Quantity':'{:,.2f}'})
+        st.dataframe(df[['Name', 'Category', '매수가(₩)', '현재가(₩)', '수익률(%)', '전일대비(%)', 'Quantity']].style.format({'매수가(₩)':'{:,.0f}','현재가(₩)':'{:,.0f}','수익률(%)':'{:+.2f}%','전일대비(%)':'{:+.2f}%','Quantity':'{:,.2f}'})
                      .applymap(lambda x: 'color: #D90429' if (isinstance(x, float) and x > 0) else ('color: #0077B6' if (isinstance(x, float) and x < 0) else ''), subset=['수익률(%)', '전일대비(%)']), use_container_width=True)
         st.plotly_chart(px.pie(df, values='평가금액(₩)', names='Category', hole=0.4, template="plotly_white"), use_container_width=True)
 
     with t2:
-        st.subheader("📅 성장 역사 리포트")
+        st.subheader("📅 성장 역사 및 자산별 비중")
         if not log_df.empty:
             report = log_df.copy().sort_values('날짜', ascending=False)
-            # [AttributeError 해결] 데이터가 1개일 때 diff() 오류 방지 로직
+            # [AttributeError/fillna 방어]
             if len(report) > 1:
                 report['자산 변화'] = report['총자산'].diff(periods=-1)
                 report['변화율(%)'] = (report['자산 변화'] / report['총자산'].shift(-1)) * 100
             else:
-                report['자산 변화'] = 0.0
-                report['변화율(%)'] = 0.0
+                report['자산 변화'], report['변화율(%)'] = 0.0, 0.0
             
             main_cols = ['날짜', '총자산', '자산 변화', '변화율(%)']
             cat_cols = [c for c in report.columns if c not in main_cols]
-            # [fillna 오류 해결] 스타일링 전 결측치 처리
-            st.dataframe(report[main_cols + cat_cols].fillna(0).style.format({
+            # 최종 결측치 처리 후 출력
+            final_report = report[main_cols + cat_cols].fillna(0)
+            st.dataframe(final_report.style.format({
                 '총자산': '{:,.0f}', '자산 변화': '{:+,.0f}', '변화율(%)': '{:+.2f}%'
             }), use_container_width=True)
-        else:
-            st.info("기록 대기 중 (1분 뒤 생성)")
+        else: st.info("기록 대기 중 (1분 뒤 생성)")
 
     st.session_state.refresh_count += 1
     time.sleep(60); st.rerun()
